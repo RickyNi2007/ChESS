@@ -1,0 +1,32 @@
+# macOS junk
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# LAMMPS / sim outputs (big; stay local)
+**/output/
+**/results/
+*.dump
+*.lammpstrj
+dump.*
+log.lammps
+*.out
+*.dat
+!**/templates/**
+
+# Editor / backups
+*~
+*.bak
+*.swp
+
+# Local learning / reference (not core pipeline code)
+Academic Papers/
+lammpssteps/
+matlabsteps/
+prep/
+unixstuff/
