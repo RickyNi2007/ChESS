@@ -1,0 +1,14 @@
+# Source: orlandoacevedo/DES
+#   DES/ITP/cl_DES.itp
+#   DES/ITP/cl_atomtypes_DES.itp
+#   DES/PDBs/chloride.pdb
+# Doherty & Acevedo, J. Phys. Chem. B 2018, 122, 9982-9993
+# Units: LAMMPS real (Å, kcal/mol)
+
+[atoms]
+#epsilon - depth of potential well
+#sigma - distance between two particles where PE = 0
+# id  type  elem  mass    charge   epsilon   sigma
+1     Cl    Cl    35.45   -0.800   0.1480    3.77
+
+# No bonds, angles, or dihedrals (single ion)
