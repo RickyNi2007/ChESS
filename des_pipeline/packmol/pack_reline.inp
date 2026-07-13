@@ -1,0 +1,29 @@
+#
+# Packmol: reline ChCl:urea 1:2  (N=10)
+# Output: packed coordinates only (no FF)
+#
+
+#min distance between atoms of diff molecules
+#write in xyz format
+#pwd of where output of packed box is
+tolerance 2.0 
+filetype xyz 
+output ../molecules/reline_pack.xyz 
+
+#use this xyz file for this molecule
+# place 10 copies of this molecule in the box
+#All copies must be inside a box from (0,0,0) to (24,24,24)
+structure ../molecules/choline.xyz 
+  number 10 
+  inside cube 0. 0. 0. 24. 
+end structure
+
+structure ../molecules/chloride.xyz
+  number 10
+  inside cube 0. 0. 0. 24.
+end structure
+
+structure ../molecules/urea.xyz
+  number 20
+  inside cube 0. 0. 0. 24.
+end structure
