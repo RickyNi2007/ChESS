@@ -1,6 +1,8 @@
 """Builds LAMMPS data.reline from Packmol XYZ + OPLS-DES params"""
 
 from pathlib import Path
+import sys
+
 # Paths relative to des_pipeline/ when you run:
 ROOT = Path(__file__).resolve().parent.parent
 #Clarification Comments:
@@ -19,7 +21,7 @@ ATOMS_PER_CHOLINE = 21
 ATOMS_PER_CHLORIDE = 1
 ATOMS_PER_UREA = 8
 BOX_LO = 0.0
-BOX_HI = 24.0
+BOX_HI = float(sys.argv[1]) if len(sys.argv) > 1 else 24.0 #e.g python scripts/build_data.py 15.32, 15.32 is manually typed and passed in a terminal command
 
 def read_xyz(path: Path):
     """Return (comment, list of (element, x, y, z))."""
