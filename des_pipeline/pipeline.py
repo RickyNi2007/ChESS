@@ -2,10 +2,13 @@
 Drive reline DES simulations: prepare run dir, run LAMMPS, parse MSD/RDF.
 """
 
+from datetime import datetime
 from pathlib import Path
 import shutil
 import subprocess
 import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
 
 
 ROOT = Path(__file__).resolve().parent
@@ -16,12 +19,16 @@ PACKMOL_TEMPLATE = ROOT / "packmol" / "pack_reline.inp.template"
 PACKMOL_INP = ROOT / "packmol" / "pack_reline.inp"
 
 #constants
-temp_start, temp_end, temp_step = 298.0, 299.0, 1
-density_start, density_end, density_step = 1.2, 1.3, .1
+temp_start, temp_end, temp_step = 298.0, 348.0, 10.0
+density_start, density_end, density_step = 1.15, 1.35, 0.05
 eq_steps = 5000
 prod_steps = 10000
 total_mass_amu = 2597.4 #10 relines (259.7 amu)
 reline_density = 1.2 #g/cm^3
+K_B = 1.380649e-23          # J/K
+AMU_TO_KG = 1.660539e-27    # kg/amu
+ANG2_FS_TO_M2_S = 1.0e-5    # 1 Å²/fs = 1e-5 m²/s
+
 
 def run_packmol(box_length: float):
     """Fill Packmol template with box length and run packmol."""
@@ -59,10 +66,10 @@ def write_lammps_input(run_dir: Path, temperature: float, eq_steps: int, prod_st
     (run_dir / "in.des").write_text(text)
 
 
-def prepare_run_dir(run_name: str, temperature: float, density: float,
+def prepare_run_dir(path_run: Path, run_name: str, temperature: float, density: float,
                     eq_steps: int = 5000, prod_steps: int = 10000) -> Path:
     """
-    For one (T, density): compute L, pack, build data, create output run folder.
+    For one (T, density): compute L, pack, build data, create point folder under path_run.
     """
     L = box_length_angstrom(density, total_mass_amu)
     print(f"T={temperature}, rho={density} -> L={L:.4f} Angstrom")
@@ -70,7 +77,7 @@ def prepare_run_dir(run_name: str, temperature: float, density: float,
     run_packmol(L)
     run_build_data(L)
 
-    run_dir = OUTPUT_DIR / run_name
+    run_dir = path_run / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(DATA_FILE, run_dir / "data.reline")
     write_lammps_input(run_dir, temperature, eq_steps, prod_steps)
@@ -148,19 +155,38 @@ def compute_s2(r, g, number_density):
     integrand[mask] = g[mask] * np.log(g[mask]) - g[mask] + 1.0
     return float(-2.0 * np.pi * number_density * np.trapezoid(integrand * r**2, r))
 
+def reduce_diffusion(D_ang2_fs, temperature_K, number_density_per_ang3, mass_per_atom_amu):
+    """
+    D* = D * rho_n^(1/3) / sqrt(kT/m)
+    Returns dimensionless D*.
+    """
+    D_m2_s = D_ang2_fs * ANG2_FS_TO_M2_S
+    rho_n_m3 = number_density_per_ang3 * 1.0e30   # 1/Å³ → 1/m³
+    m_kg = mass_per_atom_amu * AMU_TO_KG
+    thermal_speed = np.sqrt(K_B * temperature_K / m_kg)  # m/s
+    return D_m2_s * (rho_n_m3 ** (1.0 / 3.0)) / thermal_speed
+
 def main():
     if temp_start == temp_end:
-        temps = [temp_end]
+        temps = np.array([temp_end])
     else:
         temps = np.arange(temp_start, temp_end, temp_step)
     if density_start == density_end:
-        dens = [density_end]
+        dens = np.array([density_end])
     else:
         dens = np.arange(density_start, density_end, density_step)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path_run = OUTPUT_DIR / datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    path_run.mkdir(parents=True, exist_ok=True)
+    print("Run folder:", path_run)
+
+    results_T, results_rho, results_D, results_Dstar, results_s2 = [], [], [], [], []
+    summary_path = path_run / "summary.dat"
     for T in temps:
         for rho in dens:
             name = f"T{T:.1f}_rho{rho:.3f}"
-            run_dir = prepare_run_dir(name, T, rho, eq_steps, prod_steps)
+            run_dir = prepare_run_dir(path_run, name, T, rho, eq_steps, prod_steps)
             run_lammps(run_dir)
             times, msd = parse_msd(run_dir)
             D = compute_diffusion(times, msd)
@@ -169,7 +195,61 @@ def main():
             L = box_length_angstrom(rho, total_mass_amu)
             rho_n = 380.0 / (L**3)
             s2 = compute_s2(r, g, rho_n)
-            print(f"  D = {D:.6e} Ang^2/fs,  s2/kB = {s2:.4f}")
+            D_star = reduce_diffusion(D, T, rho_n, total_mass_amu / 380.0)
+            results_T.append(T)
+            results_rho.append(rho)
+            results_D.append(D)
+            results_Dstar.append(D_star)
+            results_s2.append(s2)
+            print(f"D*={D_star:.6e}, s2/kB={s2:.4f}")
+    with open(summary_path, "w") as f:
+        f.write("T_K    rho_g_cm3    D_Ang2_fs    Dstar    s2_per_kB\n")
+        for T, rho, D, Dstar, s2 in zip(
+            results_T, results_rho, results_D, results_Dstar, results_s2
+        ):
+            f.write(f"{T:.3f}  {rho:.5f}  {D:.8e}  {Dstar:.8e}  {s2:.6f}\n")
+    print("Wrote", summary_path)
+    plot_rosenfeld(path_run, results_s2, results_Dstar, temps, dens)
+
+
+def plot_rosenfeld(path_run: Path, s2s, Dstars, temps, dens):
+    s2s = np.asarray(s2s, dtype=float)
+    Dstars = np.asarray(Dstars, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    ax.yaxis.set_minor_locator(plt.LogLocator(base=10.0, subs=np.arange(2, 10)))
+    ax.minorticks_on()
+    ax.set_yscale("log")
+    ax.scatter(s2s, Dstars, alpha=0.7, s=50, color="black")
+
+    if len(s2s) > 1 and np.all(Dstars > 0):
+        # linregress on log(D*) so the fit is linear in Rosenfeld coordinates
+        slope, intercept, r, _p, _se = stats.linregress(s2s, np.log(Dstars))
+        r_squared = r**2
+        order = np.argsort(s2s)
+        x_line = s2s[order]
+        ax.plot(x_line, np.exp(slope * x_line + intercept), color="#FF9999", linewidth=2)
+        # Solved for reduced diffusion: D* = exp(a * s2/kB + b)
+        info = (
+            f"D* = exp({slope:.3f} · s₂/k_B + {intercept:.3f})\n"
+            f"R² = {r_squared:.4f}\n"
+            f"T={temps[0]:.0f}-{temps[-1]:.0f}     ΔT={temp_step:g}\n"
+            f"ρ={dens[0]:.2f}-{dens[-1]:.2f}     Δρ={density_step:g}"
+        )
+        ax.text(
+            0.58, 0.95, info,
+            transform=ax.transAxes, fontsize=9, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+
+    ax.set_xlabel(r"$s_2/k_B$")
+    ax.set_ylabel(r"$D^*$")
+    ax.set_title("Reduced Diffusion vs. Pairwise Excess Entropy")
+    fig.tight_layout()
+    out = path_run / "plot.png"
+    fig.savefig(out, dpi=150)
+    print("Wrote", out)
+    plt.close(fig)
 
 if __name__ == "__main__":
     main()

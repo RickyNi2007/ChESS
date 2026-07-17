@@ -12,18 +12,18 @@ output ../molecules/reline_pack.xyz
 
 #use this xyz file for this molecule
 # place 10 copies of this molecule in the box
-#All copies must be inside a box from (0,0,0) to (24,24,24)
+#All copies must be inside a box from (0,0,0) to (14.728258, 14.728258, 14.728258)
 structure ../molecules/choline.xyz 
   number 10 
-  inside cube 0. 0. 0. 24. 
+  inside cube 0. 0. 0. 14.728258 
 end structure
 
 structure ../molecules/chloride.xyz
   number 10
-  inside cube 0. 0. 0. 24.
+  inside cube 0. 0. 0. 14.728258
 end structure
 
 structure ../molecules/urea.xyz
   number 20
-  inside cube 0. 0. 0. 24.
+  inside cube 0. 0. 0. 14.728258
 end structure

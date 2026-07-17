@@ -29,7 +29,7 @@ LAMMPS integer types are assigned in build_data.py in this order
 (first time each name appears). Approximate LAMMPS IDs:
 
 ### 1. Choline (types 1–9)
-| LAMMPS id | name | element | meaning |
+| LAMMPS id | type name | element | meaning |
 |-----------|------|---------|---------|
 | 1 | CS | C | CH2 carbon next to N (toward ethyl alcohol arm) |
 | 2 | HS | H | hydrogens on CS |
@@ -42,12 +42,12 @@ LAMMPS integer types are assigned in build_data.py in this order
 | 9 | HA | H | methyl hydrogens |
 
 ### 2. Chloride (type 10)
-| LAMMPS id | name | element | meaning |
+| LAMMPS id | type name | element | meaning |
 |-----------|------|---------|---------|
 | 10 | Cl | Cl | chloride anion (scaled charge −0.8) |
 
 ### 3. Urea (types 11–15)
-| LAMMPS id | name | element | meaning |
+| LAMMPS id | type name | element | meaning |
 |-----------|------|---------|---------|
 | 11 | C | C | carbonyl carbon |
 | 12 | O | O | carbonyl oxygen |
