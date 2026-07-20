@@ -41,7 +41,7 @@ neigh_modify    delay 0 every 1 check yes
 
 # Thermo output during minimize / runs
 thermo_style    custom step temp pe ke etotal press vol
-thermo          100
+thermo          1000
 
 # --- Energy minimization (relax overlaps from Packmol) ---
 minimize        1.0e-4 1.0e-6 1000 10000
@@ -63,15 +63,49 @@ reset_timestep  0
 
 fix             2 all nvt temp TEMP_PLACEHOLDER TEMP_PLACEHOLDER 100.0
 
-# Radial distribution function (RDF)
-compute         rdf all rdf 100
-fix             rdf_avg all ave/time 10 100 1000 c_rdf[*] file rdf.out mode vector
+# ---------------------------------------------------------------------------
+# Species groups for molecular-site diffusion
+# WHY: all-atom MSD mixes fast H vibrations with slow molecular drift and is
+# very noisy in viscous DES. Tracking one heavy site per molecule (choline N,
+# Cl-, urea C) is a standard proxy for molecular center-of-mass diffusion.
+# ---------------------------------------------------------------------------
+group           cholN type 3
+group           Cl    type 10
+group           ureaC type 11
 
-# Mean squared displacement (MSD)
-compute         msd all msd com yes
-variable        msd_val equal c_msd[4]
+# Mean squared displacement per species (com yes removes whole-system COM drift)
+compute         msd_ch cholN msd com yes
+compute         msd_cl Cl    msd com yes
+compute         msd_ur ureaC msd com yes
+variable        msd_ch_val equal c_msd_ch[4]
+variable        msd_cl_val equal c_msd_cl[4]
+variable        msd_ur_val equal c_msd_ur[4]
 variable        time_fs equal step*dt
-fix             msd_out all print 100 "${time_fs} ${msd_val}" file msd.dat screen no title "# time_fs msd"
+fix             msd_ch_out all print 500 "${time_fs} ${msd_ch_val}" file msd_choline.dat screen no title "# time_fs msd"
+fix             msd_cl_out all print 500 "${time_fs} ${msd_cl_val}" file msd_chloride.dat screen no title "# time_fs msd"
+fix             msd_ur_out all print 500 "${time_fs} ${msd_ur_val}" file msd_urea.dat screen no title "# time_fs msd"
+
+# ---------------------------------------------------------------------------
+# Partial site-site RDFs for multicomponent pair excess entropy
+# WHY: all-atom g(r) averages every atom pair and washes out liquid structure
+# (g_max ~ 1.05). Each molecule has one of these sites, so type-type RDFs are
+# intermolecular and should show liquid-like peaks.
+# Pairs: NN, ClCl, UU (like-like) and NCl, NU, ClU (cross).
+# ---------------------------------------------------------------------------
+compute         rdf_nn  all rdf 200 3 3
+compute         rdf_clcl all rdf 200 10 10
+compute         rdf_uu  all rdf 200 11 11
+compute         rdf_ncl all rdf 200 3 10
+compute         rdf_nu  all rdf 200 3 11
+compute         rdf_clu all rdf 200 10 11
+
+# Sample every 50 steps, average 40 samples, write every 2000 steps
+fix             rdf_nn_avg  all ave/time 50 40 2000 c_rdf_nn[*]  file rdf_nn.out  mode vector
+fix             rdf_clcl_avg all ave/time 50 40 2000 c_rdf_clcl[*] file rdf_clcl.out mode vector
+fix             rdf_uu_avg  all ave/time 50 40 2000 c_rdf_uu[*]  file rdf_uu.out  mode vector
+fix             rdf_ncl_avg all ave/time 50 40 2000 c_rdf_ncl[*] file rdf_ncl.out mode vector
+fix             rdf_nu_avg  all ave/time 50 40 2000 c_rdf_nu[*]  file rdf_nu.out  mode vector
+fix             rdf_clu_avg all ave/time 50 40 2000 c_rdf_clu[*] file rdf_clu.out mode vector
 
 run             PROD_STEPS_PLACEHOLDER
 unfix           2
