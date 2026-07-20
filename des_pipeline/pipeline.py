@@ -226,7 +226,21 @@ def pair_integrand_integral(r, g):
     return float(np.trapezoid(integrand * r**2, r))
 
 
-def compute_s2_mixture(run_dir: Path, number_density_mol):
+def truncate_rdf_to_half_box(r, g, box_length):
+    """
+    Keep only r < L/2.
+
+    WHY: with periodic boundaries, distances beyond half the box are not unique
+    (you are seeing the molecule's periodic image). Integrating g(r) past L/2
+    adds noise, not real liquid structure. Increasing the pair cutoff cannot
+    fix this — you need a larger box (more molecules).
+    """
+    rmax = 0.5 * box_length
+    keep = r < rmax
+    return r[keep], g[keep], rmax
+
+
+def compute_s2_mixture(run_dir: Path, number_density_mol, box_length=None):
     """
     Multicomponent pair excess-entropy proxy (per molecule, /kB):
 
@@ -243,12 +257,21 @@ def compute_s2_mixture(run_dir: Path, number_density_mol):
     for fname, xi, xj, like_like in RDF_PARTIALS:
         path = run_dir / fname
         r, g = parse_rdf(path)
+        if box_length is not None and len(r):
+            r, g, rmax = truncate_rdf_to_half_box(r, g, box_length)
+        else:
+            rmax = float(r[-1]) if len(r) else float("nan")
         I = pair_integrand_integral(r, g)
         weight = xi * xj if like_like else 2.0 * xi * xj
         s2 += -2.0 * np.pi * number_density_mol * weight * I
         g_max = float(g.max()) if len(g) else float("nan")
         g_tail = float(g[-10:].mean()) if len(g) >= 10 else float("nan")
-        diagnostics[fname] = {"g_max": g_max, "g_tail": g_tail, "integral": I}
+        diagnostics[fname] = {
+            "g_max": g_max,
+            "g_tail": g_tail,
+            "integral": I,
+            "rmax_used": rmax,
+        }
     return float(s2), diagnostics
 
 
@@ -290,7 +313,8 @@ def analyze_state_point(run_dir: Path, temperature: float, density: float):
         else float("nan")
     )
 
-    s2, rdf_diag = compute_s2_mixture(run_dir, rho_mol)
+    # Cap s2 integral at L/2 (periodic-boundary limit), not the force cutoff.
+    s2, rdf_diag = compute_s2_mixture(run_dir, rho_mol, box_length=L)
 
     # Liquid-like RDF check: at least one partial g_max should be clearly > 1
     g_maxes = [d["g_max"] for d in rdf_diag.values()]
@@ -305,12 +329,95 @@ def analyze_state_point(run_dir: Path, temperature: float, density: float):
         "rdf_diag": rdf_diag,
         "max_gmax": max_gmax,
         "rho_mol": rho_mol,
+        "box_length": L,
     }
+
+
+def save_state_msd_plot(run_dir: Path):
+    """
+    Write run_dir/msd_check.png for this one state point.
+
+    WHY per-folder plots: easier to open T*_rho*/ and see whether THAT point
+    reached a linear Einstein regime before trusting its D*.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(10, 3.0), sharex=True)
+    for col, (fname, label) in enumerate(MSD_FILES):
+        ax = axes[col]
+        path = run_dir / fname
+        if not path.exists():
+            ax.set_title(f"{label}: missing")
+            continue
+        t, m = parse_msd(path)
+        ax.plot(t, m, color="0.3", lw=1.0)
+        start = int(len(t) * 0.4)
+        if len(t) > start + 2:
+            slope, intercept, r, *_ = stats.linregress(t[start:], m[start:])
+            t_fit = t[start:]
+            ax.plot(
+                t_fit,
+                slope * t_fit + intercept,
+                color="#FF9999",
+                lw=1.5,
+                label=f"late fit R²={r**2:.3f}\nD={slope/6:.2e} Å²/fs",
+            )
+            ax.legend(fontsize=7)
+        ax.set_title(label, fontsize=9)
+        ax.set_xlabel("time (fs)")
+        if col == 0:
+            ax.set_ylabel("MSD (Å²)")
+    fig.suptitle(f"MSD check — {run_dir.name}", fontsize=11)
+    fig.tight_layout()
+    out = run_dir / "msd_check.png"
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    return out
+
+
+def save_state_rdf_plot(run_dir: Path, box_length: float):
+    """
+    Write run_dir/rdf_check.png for this one state point.
+
+    Marks L/2 so you can see where periodic boundaries make g(r) unreliable.
+    """
+    pair_files = [p[0] for p in RDF_PARTIALS]
+    fig, axes = plt.subplots(2, 3, figsize=(11, 6.0), sharex=True)
+    axes = axes.ravel()
+    half = 0.5 * box_length
+    for col, fname in enumerate(pair_files):
+        ax = axes[col]
+        path = run_dir / fname
+        if not path.exists():
+            ax.set_title(f"{fname}: missing")
+            continue
+        r, g = parse_rdf(path)
+        ax.plot(r, g, lw=1.0, color="0.25")
+        ax.axhline(1.0, color="0.6", ls="--", lw=0.7)
+        ax.axvline(half, color="#c44e52", ls=":", lw=1.2, label=f"L/2={half:.2f} Å")
+        # shade unreliable region beyond half-box
+        if len(r):
+            ax.axvspan(half, float(r[-1]), color="#c44e52", alpha=0.08)
+        g_in = g[r < half] if len(r) else g
+        gmax = float(g_in.max()) if len(g_in) else float("nan")
+        ax.set_title(f"{fname.replace('.out', '')}\nmax(<L/2)={gmax:.2f}", fontsize=8)
+        ax.set_xlabel("r (Å)")
+        if col % 3 == 0:
+            ax.set_ylabel("g(r)")
+        ax.legend(fontsize=7, loc="upper right")
+    fig.suptitle(
+        f"Partial RDFs — {run_dir.name} (shaded = beyond L/2, do not trust)",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    out = run_dir / "rdf_check.png"
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    return out
 
 
 def save_msd_diagnostic(path_run: Path, sample_dirs):
     """
-    Plot a few MSD curves to show whether late-time Einstein regime is linear.
+    Overview MSD figure for a few state points (also written under path_run/).
+
     WHY: a Rosenfeld fit is meaningless if D itself comes from a noisy non-linear MSD.
     """
     n = len(sample_dirs)
@@ -348,8 +455,8 @@ def save_msd_diagnostic(path_run: Path, sample_dirs):
     print("Wrote", out)
 
 
-def save_rdf_diagnostic(path_run: Path, sample_dirs):
-    """Plot partial g(r) for a few state points to verify liquid-like structure."""
+def save_rdf_diagnostic(path_run: Path, sample_dirs, box_lengths=None):
+    """Overview partial g(r) figure for a few state points under path_run/."""
     n = len(sample_dirs)
     if n == 0:
         return
@@ -358,6 +465,9 @@ def save_rdf_diagnostic(path_run: Path, sample_dirs):
     if n == 1:
         axes = np.array([axes])
     for row, run_dir in enumerate(sample_dirs):
+        half = None
+        if box_lengths is not None and row < len(box_lengths):
+            half = 0.5 * box_lengths[row]
         for col, fname in enumerate(pair_files):
             ax = axes[row, col]
             path = run_dir / fname
@@ -366,12 +476,23 @@ def save_rdf_diagnostic(path_run: Path, sample_dirs):
             r, g = parse_rdf(path)
             ax.plot(r, g, lw=1.0)
             ax.axhline(1.0, color="0.6", ls="--", lw=0.7)
-            ax.set_title(f"{run_dir.name}\n{fname.replace('.out','')}\nmax={g.max():.2f}", fontsize=7)
+            if half is not None:
+                ax.axvline(half, color="#c44e52", ls=":", lw=1.0)
+                if len(r):
+                    ax.axvspan(half, float(r[-1]), color="#c44e52", alpha=0.08)
+                g_in = g[r < half]
+                gmax = float(g_in.max()) if len(g_in) else float("nan")
+            else:
+                gmax = float(g.max()) if len(g) else float("nan")
+            ax.set_title(f"{run_dir.name}\n{fname.replace('.out','')}\nmax={gmax:.2f}", fontsize=7)
             if row == n - 1:
                 ax.set_xlabel("r (Å)")
             if col == 0:
                 ax.set_ylabel("g(r)")
-    fig.suptitle("Partial site-site RDFs (liquid-like peaks should be clearly > 1)", fontsize=11)
+    fig.suptitle(
+        "Partial site-site RDFs (liquid-like peaks >> 1; red = beyond L/2)",
+        fontsize=11,
+    )
     fig.tight_layout()
     out = path_run / "rdf_check.png"
     fig.savefig(out, dpi=140)
@@ -411,6 +532,11 @@ def main():
             finished_dirs.append(run_dir)
 
             ana = analyze_state_point(run_dir, T, rho)
+            # Per-state diagnostic PNGs inside T*_rho*/ (in addition to run-level overview)
+            msd_png = save_state_msd_plot(run_dir)
+            rdf_png = save_state_rdf_plot(run_dir, ana["box_length"])
+            print(f"  wrote {msd_png.name}, {rdf_png.name}")
+
             results_T.append(T)
             results_rho.append(rho)
             results_D.append(ana["D"])
@@ -460,13 +586,20 @@ def main():
             )
     print("Wrote", summary_csv)
 
-    # Diagnostics on a few representative finished points
+    # Run-level overview diagnostics on a few representative finished points
     sample = []
+    sample_L = []
     if finished_dirs:
-        sample = [finished_dirs[0], finished_dirs[len(finished_dirs) // 2], finished_dirs[-1]]
-        sample = list(dict.fromkeys(sample))
+        idxs = [0, len(finished_dirs) // 2, len(finished_dirs) - 1]
+        seen = set()
+        for i in idxs:
+            if i in seen:
+                continue
+            seen.add(i)
+            sample.append(finished_dirs[i])
+            sample_L.append(results_meta[i]["box_length"])
     save_msd_diagnostic(path_run, sample)
-    save_rdf_diagnostic(path_run, sample)
+    save_rdf_diagnostic(path_run, sample, box_lengths=sample_L)
 
     plot_rosenfeld(path_run, results_s2, results_Dstar, results_T, results_rho)
 
