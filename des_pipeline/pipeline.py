@@ -28,12 +28,15 @@ PACKMOL_INP = ROOT / "packmol" / "pack_reline.inp"
 # WHY wider T window: Rosenfeld needs s2 to change; 300-304 K was too narrow.
 # WHY denser around 1.14-1.23: experimental anhydrous reline is ~1.16-1.20 g/cm3
 # near room temperature; 1.30-1.35 was unrealistically compressed.
-# WHY more steps: previous 5+10 ps MSDs were not linear (viscous DES needs more).
+# WHY more steps (NOT a bigger timestep): physical time = steps × dt.
+# We keep dt = 1 fs (safe for all-atom H vibrations). Making dt larger without
+# bond constraints (SHAKE) risks unstable MD. Longer runs = more steps.
+# Target: ~1 ns production so viscous Reline can leave the caging regime.
 # ---------------------------------------------------------------------------
 temp_start, temp_end, temp_step = 298.0, 348.0, 10.0   # 298,308,318,328,338 K
 density_start, density_end, density_step = 1.14, 1.24, 0.03  # 1.14,1.17,1.20,1.23
-eq_steps = 50000      # 50 ps equilibration
-prod_steps = 200000   # 200 ps production
+eq_steps = 200000       # 200 ps equilibration  (dt=1 fs)
+prod_steps = 1000000    # 1.0 ns production     (dt=1 fs)
 
 # System counts (must match Packmol / build_data.py)
 N_CHOLINE = 10
