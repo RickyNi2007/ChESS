@@ -55,22 +55,44 @@ K_B = 1.380649e-23          # J/K
 AMU_TO_KG = 1.660539e-27    # kg/amu
 ANG2_FS_TO_M2_S = 1.0e-5    # 1 Å²/fs = 1e-5 m²/s
 
-# Partial RDF files written by in.des.template (site-site)
-# (filename, x_i, x_j, like_like) — cross terms counted once so factor 2 in s2
+# Partial RDFs: one multi-pair file rdf.out from LAMMPS (see in.des.template).
+# pair_index selects which g(r) column set (0-based) inside that file.
+# (label, pair_index, x_i, x_j, like_like)
 RDF_PARTIALS = [
-    ("rdf_nn.out", X_CH, X_CH, True),
-    ("rdf_clcl.out", X_CL, X_CL, True),
-    ("rdf_uu.out", X_UR, X_UR, True),
-    ("rdf_ncl.out", X_CH, X_CL, False),
-    ("rdf_nu.out", X_CH, X_UR, False),
-    ("rdf_clu.out", X_CL, X_UR, False),
+    ("nn", 0, X_CH, X_CH, True),
+    ("clcl", 1, X_CL, X_CL, True),
+    ("uu", 2, X_UR, X_UR, True),
+    ("ncl", 3, X_CH, X_CL, False),
+    ("nu", 4, X_CH, X_UR, False),
+    ("clu", 5, X_CL, X_UR, False),
 ]
+
+# How often to sample RDF during production (steps). Larger = faster, noisier g(r).
+# Final write is once at prod_steps; pipeline only uses that last (only) block.
+RDF_TARGET_NEVERY = 2000
 
 MSD_FILES = [
     ("msd_choline.dat", "choline"),
     ("msd_chloride.dat", "chloride"),
     ("msd_urea.dat", "urea"),
 ]
+
+
+def rdf_ave_params(prod_steps: int, target_nevery: int = RDF_TARGET_NEVERY):
+    """
+    Build fix ave/time (Nevery, Nrepeat, Nfreq) for ONE RDF write at end of production.
+
+    LAMMPS requires Nfreq = Nevery * Nrepeat. We choose Nevery near target_nevery
+    that divides prod_steps, then Nrepeat = prod_steps // Nevery, Nfreq = prod_steps.
+    """
+    if prod_steps < 1:
+        raise ValueError("prod_steps must be positive")
+    nevery = min(target_nevery, prod_steps)
+    while nevery > 1 and prod_steps % nevery != 0:
+        nevery -= 1
+    nrepeat = prod_steps // nevery
+    nfreq = nevery * nrepeat  # == prod_steps
+    return nevery, nrepeat, nfreq
 
 
 def _find_exe(names):
@@ -116,11 +138,19 @@ def run_build_data(box_length: float):
 
 def write_lammps_input(run_dir: Path, temperature: float, eq_steps: int, prod_steps: int):
     """Fill in.des.template placeholders and write into run_dir."""
+    nevery, nrepeat, nfreq = rdf_ave_params(prod_steps)
     text = TEMPLATE.read_text()
     text = text.replace("TEMP_PLACEHOLDER", str(temperature))
     text = text.replace("EQ_STEPS_PLACEHOLDER", str(eq_steps))
     text = text.replace("PROD_STEPS_PLACEHOLDER", str(prod_steps))
+    text = text.replace("RDF_NEVERY_PLACEHOLDER", str(nevery))
+    text = text.replace("RDF_NREPEAT_PLACEHOLDER", str(nrepeat))
+    text = text.replace("RDF_NFREQ_PLACEHOLDER", str(nfreq))
     (run_dir / "in.des").write_text(text)
+    print(
+        f"  RDF ave/time: Nevery={nevery}, Nrepeat={nrepeat}, Nfreq={nfreq} "
+        f"(one block at end of {prod_steps} steps)"
+    )
 
 
 def prepare_run_dir(path_run: Path, run_name: str, temperature: float, density: float,
@@ -204,9 +234,17 @@ def compute_diffusion(times, msd, late_frac_start=0.4):
     return slope / 6.0, float(r**2)  # Å^2 / fs
 
 
-def parse_rdf(path: Path):
-    """Return last time-averaged RDF block: r (Å), g(r)."""
+def parse_rdf(path: Path, pair_index: int = 0):
+    """
+    Return last time-averaged RDF block for one pair: r (Å), g(r).
+
+    Supports:
+      - single-pair files: columns [bin, r, g, ...]
+      - multi-pair rdf.out: columns [bin, r, g0, coord0, g1, coord1, ...]
+        pair_index selects which g column (0-based).
+    """
     r, g = [], []
+    g_col = 2 + 2 * pair_index
     with open(path) as f:
         for line in f:
             if line.startswith("#"):
@@ -215,9 +253,9 @@ def parse_rdf(path: Path):
             if len(parts) == 2:  # "timestep nrows" header → new block
                 r, g = [], []
                 continue
-            if len(parts) >= 3:
+            if len(parts) > g_col:
                 r.append(float(parts[1]))
-                g.append(float(parts[2]))
+                g.append(float(parts[g_col]))
     return np.array(r), np.array(g)
 
 
@@ -255,11 +293,11 @@ def compute_s2_mixture(run_dir: Path, number_density_mol, box_length=None):
     WHY: this is the standard mixture extension of the atomic s2 formula and
     matches molecular mole fractions of our site RDFs.
     """
+    rdf_path = run_dir / "rdf.out"
     s2 = 0.0
     diagnostics = {}
-    for fname, xi, xj, like_like in RDF_PARTIALS:
-        path = run_dir / fname
-        r, g = parse_rdf(path)
+    for label, pair_index, xi, xj, like_like in RDF_PARTIALS:
+        r, g = parse_rdf(rdf_path, pair_index=pair_index)
         if box_length is not None and len(r):
             r, g, rmax = truncate_rdf_to_half_box(r, g, box_length)
         else:
@@ -269,7 +307,7 @@ def compute_s2_mixture(run_dir: Path, number_density_mol, box_length=None):
         s2 += -2.0 * np.pi * number_density_mol * weight * I
         g_max = float(g.max()) if len(g) else float("nan")
         g_tail = float(g[-10:].mean()) if len(g) >= 10 else float("nan")
-        diagnostics[fname] = {
+        diagnostics[label] = {
             "g_max": g_max,
             "g_tail": g_tail,
             "integral": I,
@@ -382,26 +420,24 @@ def save_state_rdf_plot(run_dir: Path, box_length: float):
 
     Marks L/2 so you can see where periodic boundaries make g(r) unreliable.
     """
-    pair_files = [p[0] for p in RDF_PARTIALS]
+    rdf_path = run_dir / "rdf.out"
     fig, axes = plt.subplots(2, 3, figsize=(11, 6.0), sharex=True)
     axes = axes.ravel()
     half = 0.5 * box_length
-    for col, fname in enumerate(pair_files):
+    for col, (label, pair_index, _xi, _xj, _like) in enumerate(RDF_PARTIALS):
         ax = axes[col]
-        path = run_dir / fname
-        if not path.exists():
-            ax.set_title(f"{fname}: missing")
+        if not rdf_path.exists():
+            ax.set_title(f"{label}: missing rdf.out")
             continue
-        r, g = parse_rdf(path)
+        r, g = parse_rdf(rdf_path, pair_index=pair_index)
         ax.plot(r, g, lw=1.0, color="0.25")
         ax.axhline(1.0, color="0.6", ls="--", lw=0.7)
         ax.axvline(half, color="#c44e52", ls=":", lw=1.2, label=f"L/2={half:.2f} Å")
-        # shade unreliable region beyond half-box
         if len(r):
             ax.axvspan(half, float(r[-1]), color="#c44e52", alpha=0.08)
         g_in = g[r < half] if len(r) else g
         gmax = float(g_in.max()) if len(g_in) else float("nan")
-        ax.set_title(f"{fname.replace('.out', '')}\nmax(<L/2)={gmax:.2f}", fontsize=8)
+        ax.set_title(f"rdf_{label}\nmax(<L/2)={gmax:.2f}", fontsize=8)
         ax.set_xlabel("r (Å)")
         if col % 3 == 0:
             ax.set_ylabel("g(r)")
@@ -463,20 +499,19 @@ def save_rdf_diagnostic(path_run: Path, sample_dirs, box_lengths=None):
     n = len(sample_dirs)
     if n == 0:
         return
-    pair_files = [p[0] for p in RDF_PARTIALS]
-    fig, axes = plt.subplots(n, len(pair_files), figsize=(14, 2.4 * n), sharex=True)
+    fig, axes = plt.subplots(n, len(RDF_PARTIALS), figsize=(14, 2.4 * n), sharex=True)
     if n == 1:
         axes = np.array([axes])
     for row, run_dir in enumerate(sample_dirs):
         half = None
         if box_lengths is not None and row < len(box_lengths):
             half = 0.5 * box_lengths[row]
-        for col, fname in enumerate(pair_files):
+        rdf_path = run_dir / "rdf.out"
+        for col, (label, pair_index, _xi, _xj, _like) in enumerate(RDF_PARTIALS):
             ax = axes[row, col]
-            path = run_dir / fname
-            if not path.exists():
+            if not rdf_path.exists():
                 continue
-            r, g = parse_rdf(path)
+            r, g = parse_rdf(rdf_path, pair_index=pair_index)
             ax.plot(r, g, lw=1.0)
             ax.axhline(1.0, color="0.6", ls="--", lw=0.7)
             if half is not None:
@@ -487,7 +522,7 @@ def save_rdf_diagnostic(path_run: Path, sample_dirs, box_lengths=None):
                 gmax = float(g_in.max()) if len(g_in) else float("nan")
             else:
                 gmax = float(g.max()) if len(g) else float("nan")
-            ax.set_title(f"{run_dir.name}\n{fname.replace('.out','')}\nmax={gmax:.2f}", fontsize=7)
+            ax.set_title(f"{run_dir.name}\nrdf_{label}\nmax={gmax:.2f}", fontsize=7)
             if row == n - 1:
                 ax.set_xlabel("r (Å)")
             if col == 0:

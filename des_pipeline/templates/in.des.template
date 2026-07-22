@@ -90,26 +90,21 @@ fix             msd_ur_out all print 1000 "${time_fs} ${msd_ur_val}" file msd_ur
 
 # ---------------------------------------------------------------------------
 # Partial site-site RDFs for multicomponent pair excess entropy
-# WHY: all-atom g(r) averages every atom pair and washes out liquid structure
-# (g_max ~ 1.05). Each molecule has one of these sites, so type-type RDFs are
-# intermolecular and should show liquid-like peaks.
-# Pairs: NN, ClCl, UU (like-like) and NCl, NU, ClU (cross).
+# WHY: all-atom g(r) averages every atom pair and washes out liquid structure.
+# Each molecule has one of these sites, so type-type RDFs are intermolecular.
+#
+# SPEED: one multi-pair compute (not six) + one write at end of production.
+# pipeline.py only uses the LAST averaged block for s2, so printing many
+# intermediate RDF blocks wastes I/O and (with frequent sampling) CPU.
+# Placeholders filled by pipeline.py from prod_steps:
+#   RDF_NEVERY * RDF_NREPEAT = RDF_NFREQ = PROD_STEPS  → single final block
 # ---------------------------------------------------------------------------
-compute         rdf_nn  all rdf 200 3 3
-compute         rdf_clcl all rdf 200 10 10
-compute         rdf_uu  all rdf 200 11 11
-compute         rdf_ncl all rdf 200 3 10
-compute         rdf_nu  all rdf 200 3 11
-compute         rdf_clu all rdf 200 10 11
-
-# Sample every 100 steps, average 50 samples, write every 5000 steps
-# (longer averaging window for smoother g(r) on ns runs)
-fix             rdf_nn_avg  all ave/time 100 50 5000 c_rdf_nn[*]  file rdf_nn.out  mode vector
-fix             rdf_clcl_avg all ave/time 100 50 5000 c_rdf_clcl[*] file rdf_clcl.out mode vector
-fix             rdf_uu_avg  all ave/time 100 50 5000 c_rdf_uu[*]  file rdf_uu.out  mode vector
-fix             rdf_ncl_avg all ave/time 100 50 5000 c_rdf_ncl[*] file rdf_ncl.out mode vector
-fix             rdf_nu_avg  all ave/time 100 50 5000 c_rdf_nu[*]  file rdf_nu.out  mode vector
-fix             rdf_clu_avg all ave/time 100 50 5000 c_rdf_clu[*] file rdf_clu.out mode vector
+# Pair order (must match pipeline.py RDF_PARTIALS):
+#   1: N-N (3 3), 2: Cl-Cl (10 10), 3: U-U (11 11),
+#   4: N-Cl (3 10), 5: N-U (3 11), 6: Cl-U (10 11)
+compute         rdf_all all rdf 200 3 3 10 10 11 11 3 10 3 11 10 11
+fix             rdf_avg all ave/time RDF_NEVERY_PLACEHOLDER RDF_NREPEAT_PLACEHOLDER RDF_NFREQ_PLACEHOLDER &
+                c_rdf_all[*] file rdf.out mode vector
 
 run             PROD_STEPS_PLACEHOLDER
 unfix           2
