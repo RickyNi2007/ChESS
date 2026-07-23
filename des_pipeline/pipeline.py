@@ -191,18 +191,35 @@ def run_lammps(run_dir: Path):
         raise RuntimeError("LAMMPS executable not found on PATH (tried lmp, lmp_serial, lammps, lmp_mpi)")
 
     mpirun = _find_exe(["mpirun", "mpiexec"])
-    with open(run_dir / "experiment.log", "w") as log:
+    log_path = run_dir / "experiment.log"
+    with open(log_path, "w") as log:
         if mpirun:
             cmd = [mpirun, "-np", "4", lmp, "-in", "in.des"]
         else:
             cmd = [lmp, "-in", "in.des"]
-        subprocess.run(
-            cmd,
-            cwd=run_dir,
-            check=True,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
+        try:
+            subprocess.run(
+                cmd,
+                cwd=run_dir,
+                check=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        except subprocess.CalledProcessError as exc:
+            # WHY: the Python traceback only shows "exit status 1"; the real
+            # LAMMPS/MPI reason is at the end of experiment.log.
+            print(f"\n*** LAMMPS failed in {run_dir} ***")
+            print(f"*** Command: {' '.join(cmd)}")
+            print(f"*** Showing last 60 lines of {log_path}:\n")
+            try:
+                lines = log_path.read_text(errors="replace").splitlines()
+                print("\n".join(lines[-60:]))
+            except OSError as read_err:
+                print(f"(could not read log: {read_err})")
+            print("\n*** End of experiment.log tail ***\n")
+            raise RuntimeError(
+                f"LAMMPS failed for {run_dir.name}. See experiment.log tail above."
+            ) from exc
 
 
 def parse_msd(path: Path):
