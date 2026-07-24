@@ -66,45 +66,18 @@ reset_timestep  0
 fix             2 all nvt temp TEMP_PLACEHOLDER TEMP_PLACEHOLDER 100.0
 
 # ---------------------------------------------------------------------------
-# Species groups for molecular-site diffusion
-# WHY: all-atom MSD mixes fast H vibrations with slow molecular drift and is
-# very noisy in viscous DES. Tracking one heavy site per molecule (choline N,
-# Cl-, urea C) is a standard proxy for molecular center-of-mass diffusion.
-# ---------------------------------------------------------------------------
-group           cholN type 3
-group           Cl    type 10
-group           ureaC type 11
-
-# Mean squared displacement per species (com yes removes whole-system COM drift)
-compute         msd_ch cholN msd com yes
-compute         msd_cl Cl    msd com yes
-compute         msd_ur ureaC msd com yes
-variable        msd_ch_val equal c_msd_ch[4]
-variable        msd_cl_val equal c_msd_cl[4]
-variable        msd_ur_val equal c_msd_ur[4]
-variable        time_fs equal step*dt
-# Print every 1000 fs — fine for ns-scale runs (keeps MSD files manageable)
-fix             msd_ch_out all print 1000 "${time_fs} ${msd_ch_val}" file msd_choline.dat screen no title "# time_fs msd"
-fix             msd_cl_out all print 1000 "${time_fs} ${msd_cl_val}" file msd_chloride.dat screen no title "# time_fs msd"
-fix             msd_ur_out all print 1000 "${time_fs} ${msd_ur_val}" file msd_urea.dat screen no title "# time_fs msd"
-
-# ---------------------------------------------------------------------------
-# Partial site-site RDFs for multicomponent pair excess entropy
-# WHY: all-atom g(r) averages every atom pair and washes out liquid structure.
-# Each molecule has one of these sites, so type-type RDFs are intermolecular.
+# Dump unwrapped atom coordinates for molecular center-of-mass (COM) analysis
 #
-# SPEED: one multi-pair compute (not six) + one write at end of production.
-# pipeline.py only uses the LAST averaged block for s2, so printing many
-# intermediate RDF blocks wastes I/O and (with frequent sampling) CPU.
-# Placeholders filled by pipeline.py from prod_steps:
-#   RDF_NEVERY * RDF_NREPEAT = RDF_NFREQ = PROD_STEPS  → single final block
+# WHY: MSD and RDF are computed in pipeline.py from true molecular COMs:
+#   R_com = sum(m_i * r_i) / sum(m_i)
+# using molecule IDs from data.reline (1-10 choline, 11-20 Cl, 21-40 urea).
+# Unwrapped xu,yu,zu keep molecules intact across periodic boundaries.
+#
+# DUMP_EVERY_PLACEHOLDER is filled by pipeline.py (~200 frames over production).
 # ---------------------------------------------------------------------------
-# Pair order (must match pipeline.py RDF_PARTIALS):
-#   1: N-N (3 3), 2: Cl-Cl (10 10), 3: U-U (11 11),
-#   4: N-Cl (3 10), 5: N-U (3 11), 6: Cl-U (10 11)
-compute         rdf_all all rdf 200 3 3 10 10 11 11 3 10 3 11 10 11
-fix             rdf_avg all ave/time RDF_NEVERY_PLACEHOLDER RDF_NREPEAT_PLACEHOLDER RDF_NFREQ_PLACEHOLDER &
-                c_rdf_all[*] file rdf.out mode vector
+dump            comtraj all custom DUMP_EVERY_PLACEHOLDER dump.com.lammpstrj id mol type mass xu yu zu
+dump_modify     comtraj sort id
 
 run             PROD_STEPS_PLACEHOLDER
 unfix           2
+undump          comtraj

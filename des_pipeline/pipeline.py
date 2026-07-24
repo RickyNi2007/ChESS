@@ -1,9 +1,9 @@
 """
 Drive reline DES simulations: prepare run dir, run LAMMPS, parse MSD/RDF.
 
-Rosenfeld-style analysis uses:
-  - molecular-site diffusion (choline N, Cl, urea C) instead of all-atom MSD
-  - multicomponent pair excess entropy from partial site-site RDFs
+Rosenfeld-style analysis uses *molecular center-of-mass* (COM) quantities:
+  - COM MSD for choline / chloride / urea (from dump.com.lammpstrj)
+  - COM–COM partial RDFs → mixture pair excess-entropy proxy s2
 """
 
 from datetime import datetime
@@ -14,6 +14,10 @@ import sys
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import stats
+
+# Molecular COM helpers (true center-of-mass MSD / RDF)
+sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+import molecular_com as mcom
 
 
 ROOT = Path(__file__).resolve().parent
@@ -44,7 +48,7 @@ N_CHLORIDE = 10
 N_UREA = 20
 N_ATOMS = 380
 N_MOLECULES = N_CHOLINE + N_CHLORIDE + N_UREA  # 40
-# Mole fractions for molecular sites used in s2
+# Mole fractions for molecular COM mixture s2
 X_CH = N_CHOLINE / N_MOLECULES   # 0.25
 X_CL = N_CHLORIDE / N_MOLECULES  # 0.25
 X_UR = N_UREA / N_MOLECULES      # 0.50
@@ -55,21 +59,16 @@ K_B = 1.380649e-23          # J/K
 AMU_TO_KG = 1.660539e-27    # kg/amu
 ANG2_FS_TO_M2_S = 1.0e-5    # 1 Å²/fs = 1e-5 m²/s
 
-# Partial RDFs: one multi-pair file rdf.out from LAMMPS (see in.des.template).
-# pair_index selects which g(r) column set (0-based) inside that file.
-# (label, pair_index, x_i, x_j, like_like)
-RDF_PARTIALS = [
-    ("nn", 0, X_CH, X_CH, True),
-    ("clcl", 1, X_CL, X_CL, True),
-    ("uu", 2, X_UR, X_UR, True),
-    ("ncl", 3, X_CH, X_CL, False),
-    ("nu", 4, X_CH, X_UR, False),
-    ("clu", 5, X_CL, X_UR, False),
-]
-
-# How often to sample RDF during production (steps). Larger = faster, noisier g(r).
-# Final write is once at prod_steps; pipeline only uses that last (only) block.
-RDF_TARGET_NEVERY = 2000
+# COM–COM partial RDFs (labels kept for continuity with older nn/clcl/... names)
+# Weights use molecular mole fractions.
+COM_S2_WEIGHTS = {
+    "nn": (X_CH, X_CH, True),
+    "clcl": (X_CL, X_CL, True),
+    "uu": (X_UR, X_UR, True),
+    "ncl": (X_CH, X_CL, False),
+    "nu": (X_CH, X_UR, False),
+    "clu": (X_CL, X_UR, False),
+}
 
 MSD_FILES = [
     ("msd_choline.dat", "choline"),
@@ -78,21 +77,17 @@ MSD_FILES = [
 ]
 
 
-def rdf_ave_params(prod_steps: int, target_nevery: int = RDF_TARGET_NEVERY):
+def dump_every_steps(prod_steps: int, target_frames: int = 200) -> int:
     """
-    Build fix ave/time (Nevery, Nrepeat, Nfreq) for ONE RDF write at end of production.
-
-    LAMMPS requires Nfreq = Nevery * Nrepeat. We choose Nevery near target_nevery
-    that divides prod_steps, then Nrepeat = prod_steps // Nevery, Nfreq = prod_steps.
+    How often to dump atoms during production (~target_frames frames).
+    Must divide production length so the final step is included.
     """
     if prod_steps < 1:
         raise ValueError("prod_steps must be positive")
-    nevery = min(target_nevery, prod_steps)
-    while nevery > 1 and prod_steps % nevery != 0:
-        nevery -= 1
-    nrepeat = prod_steps // nevery
-    nfreq = nevery * nrepeat  # == prod_steps
-    return nevery, nrepeat, nfreq
+    every = max(1, prod_steps // target_frames)
+    while prod_steps % every != 0 and every > 1:
+        every -= 1
+    return every
 
 
 def _find_exe(names):
@@ -138,18 +133,17 @@ def run_build_data(box_length: float):
 
 def write_lammps_input(run_dir: Path, temperature: float, eq_steps: int, prod_steps: int):
     """Fill in.des.template placeholders and write into run_dir."""
-    nevery, nrepeat, nfreq = rdf_ave_params(prod_steps)
+    dump_every = dump_every_steps(prod_steps)
     text = TEMPLATE.read_text()
     text = text.replace("TEMP_PLACEHOLDER", str(temperature))
     text = text.replace("EQ_STEPS_PLACEHOLDER", str(eq_steps))
     text = text.replace("PROD_STEPS_PLACEHOLDER", str(prod_steps))
-    text = text.replace("RDF_NEVERY_PLACEHOLDER", str(nevery))
-    text = text.replace("RDF_NREPEAT_PLACEHOLDER", str(nrepeat))
-    text = text.replace("RDF_NFREQ_PLACEHOLDER", str(nfreq))
+    text = text.replace("DUMP_EVERY_PLACEHOLDER", str(dump_every))
     (run_dir / "in.des").write_text(text)
+    n_frames = prod_steps // dump_every + 1  # includes step 0
     print(
-        f"  RDF ave/time: Nevery={nevery}, Nrepeat={nrepeat}, Nfreq={nfreq} "
-        f"(one block at end of {prod_steps} steps)"
+        f"  COM dump every {dump_every} steps "
+        f"(~{n_frames} frames for molecular COM MSD/RDF)"
     )
 
 
@@ -237,45 +231,6 @@ def parse_msd(path: Path):
     return np.array(times), np.array(msd)
 
 
-def compute_diffusion(times, msd, late_frac_start=0.4):
-    """
-    Einstein: MSD = 6 D t  →  D = slope/6.
-    Uses the late-time window and returns (D, R2_late) so callers can judge quality.
-    """
-    if len(times) < 5:
-        return float("nan"), 0.0
-    start = int(len(times) * late_frac_start)
-    t = times[start:]
-    m = msd[start:]
-    slope, _intercept, r, _p, _se = stats.linregress(t, m)
-    return slope / 6.0, float(r**2)  # Å^2 / fs
-
-
-def parse_rdf(path: Path, pair_index: int = 0):
-    """
-    Return last time-averaged RDF block for one pair: r (Å), g(r).
-
-    Supports:
-      - single-pair files: columns [bin, r, g, ...]
-      - multi-pair rdf.out: columns [bin, r, g0, coord0, g1, coord1, ...]
-        pair_index selects which g column (0-based).
-    """
-    r, g = [], []
-    g_col = 2 + 2 * pair_index
-    with open(path) as f:
-        for line in f:
-            if line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) == 2:  # "timestep nrows" header → new block
-                r, g = [], []
-                continue
-            if len(parts) > g_col:
-                r.append(float(parts[1]))
-                g.append(float(parts[g_col]))
-    return np.array(r), np.array(g)
-
-
 def pair_integrand_integral(r, g):
     """∫ [g ln g - g + 1] r^2 dr  (g=0 bins contribute +1)."""
     integrand = np.ones_like(g)
@@ -284,41 +239,16 @@ def pair_integrand_integral(r, g):
     return float(np.trapezoid(integrand * r**2, r))
 
 
-def truncate_rdf_to_half_box(r, g, box_length):
+def compute_s2_from_com_rdfs(rdf_tables, number_density_mol):
     """
-    Keep only r < L/2.
-
-    WHY: with periodic boundaries, distances beyond half the box are not unique
-    (you are seeing the molecule's periodic image). Integrating g(r) past L/2
-    adds noise, not real liquid structure. Increasing the pair cutoff cannot
-    fix this — you need a larger box (more molecules).
-    """
-    rmax = 0.5 * box_length
-    keep = r < rmax
-    return r[keep], g[keep], rmax
-
-
-def compute_s2_mixture(run_dir: Path, number_density_mol, box_length=None):
-    """
-    Multicomponent pair excess-entropy proxy (per molecule, /kB):
+    Multicomponent pair excess-entropy proxy from molecular COM–COM g_ij(r).
 
       s2/kB = -2 π ρ_mol Σ_i Σ_j x_i x_j ∫ [g_ij ln g_ij - g_ij + 1] r^2 dr
-
-    Like-like pairs appear once (i=j). Cross pairs are stored once, so we
-    multiply by 2 to account for both (i,j) and (j,i) in the double sum.
-
-    WHY: this is the standard mixture extension of the atomic s2 formula and
-    matches molecular mole fractions of our site RDFs.
     """
-    rdf_path = run_dir / "rdf.out"
     s2 = 0.0
     diagnostics = {}
-    for label, pair_index, xi, xj, like_like in RDF_PARTIALS:
-        r, g = parse_rdf(rdf_path, pair_index=pair_index)
-        if box_length is not None and len(r):
-            r, g, rmax = truncate_rdf_to_half_box(r, g, box_length)
-        else:
-            rmax = float(r[-1]) if len(r) else float("nan")
+    for label, (xi, xj, like_like) in COM_S2_WEIGHTS.items():
+        r, g = rdf_tables[label]
         I = pair_integrand_integral(r, g)
         weight = xi * xj if like_like else 2.0 * xi * xj
         s2 += -2.0 * np.pi * number_density_mol * weight * I
@@ -328,7 +258,7 @@ def compute_s2_mixture(run_dir: Path, number_density_mol, box_length=None):
             "g_max": g_max,
             "g_tail": g_tail,
             "integral": I,
-            "rmax_used": rmax,
+            "rmax_used": float(r[-1]) if len(r) else float("nan"),
         }
     return float(s2), diagnostics
 
@@ -347,22 +277,52 @@ def reduce_diffusion(D_ang2_fs, temperature_K, number_density_per_ang3, mass_per
 
 def analyze_state_point(run_dir: Path, temperature: float, density: float):
     """
-    Parse species MSDs + partial RDFs for one finished state point.
-    Returns dict with D (avg), D*, s2, and quality diagnostics.
+    Build molecular COMs from dump.com.lammpstrj, then COM-MSD and COM-RDF.
+
+    Algorithm (see scripts/molecular_com.py):
+      R_com(mol) = sum_atoms(m_i * r_i) / sum_atoms(m_i)
     """
     L = box_length_angstrom(density, total_mass_amu)
     rho_mol = N_MOLECULES / (L**3)
     mass_per_mol = total_mass_amu / N_MOLECULES
 
+    dump_path = run_dir / "dump.com.lammpstrj"
+    if not dump_path.exists():
+        raise FileNotFoundError(
+            f"Missing {dump_path}. LAMMPS must dump unwrapped atoms for COM analysis."
+        )
+
+    times, box_from_dump, com_traj = mcom.trajectory_molecular_coms(dump_path)
+    # Prefer geometric L from density; warn if dump disagrees a lot
+    if abs(box_from_dump - L) / L > 0.02:
+        print(
+            f"  Warning: dump box L={box_from_dump:.4f} vs density L={L:.4f}; "
+            f"using density L for RDF/PBC"
+        )
+
     species_D = {}
     species_R2 = {}
     for fname, label in MSD_FILES:
-        times, msd = parse_msd(run_dir / fname)
-        D, r2 = compute_diffusion(times, msd)
+        mol_ids = mcom.SPECIES_MOLS[label]
+        t, msd, D, r2 = mcom.species_msd_from_coms(times, com_traj, mol_ids)
+        mcom.write_msd_dat(run_dir / fname, t, msd)
         species_D[label] = D
         species_R2[label] = r2
 
-    # Average only positive, finite species diffusivities
+    # COM–COM partial RDFs (averaged over dump frames)
+    rdf_tables = {}
+    for label, sp_i, sp_j, like in mcom.COM_RDF_PAIRS:
+        r, g = mcom.partial_rdf_coms(
+            com_traj,
+            mcom.SPECIES_MOLS[sp_i],
+            mcom.SPECIES_MOLS[sp_j],
+            L,
+            n_bins=200,
+            same_species=like,
+        )
+        rdf_tables[label] = (r, g)
+        mcom.write_rdf_pair_dat(run_dir / f"rdf_com_{label}.dat", r, g)
+
     good = [D for D in species_D.values() if np.isfinite(D) and D > 0]
     D_avg = float(np.mean(good)) if good else float("nan")
     D_star = (
@@ -371,10 +331,7 @@ def analyze_state_point(run_dir: Path, temperature: float, density: float):
         else float("nan")
     )
 
-    # Cap s2 integral at L/2 (periodic-boundary limit), not the force cutoff.
-    s2, rdf_diag = compute_s2_mixture(run_dir, rho_mol, box_length=L)
-
-    # Liquid-like RDF check: at least one partial g_max should be clearly > 1
+    s2, rdf_diag = compute_s2_from_com_rdfs(rdf_tables, rho_mol)
     g_maxes = [d["g_max"] for d in rdf_diag.values()]
     max_gmax = max(g_maxes) if g_maxes else float("nan")
 
@@ -388,15 +345,13 @@ def analyze_state_point(run_dir: Path, temperature: float, density: float):
         "max_gmax": max_gmax,
         "rho_mol": rho_mol,
         "box_length": L,
+        "rdf_tables": rdf_tables,
     }
 
 
 def save_state_msd_plot(run_dir: Path):
     """
-    Write run_dir/msd_check.png for this one state point.
-
-    WHY per-folder plots: easier to open T*_rho*/ and see whether THAT point
-    reached a linear Einstein regime before trusting its D*.
+    Write run_dir/msd_check.png for this one state point (molecular COM MSD).
     """
     fig, axes = plt.subplots(1, 3, figsize=(10, 3.0), sharex=True)
     for col, (fname, label) in enumerate(MSD_FILES):
@@ -419,11 +374,11 @@ def save_state_msd_plot(run_dir: Path):
                 label=f"late fit R²={r**2:.3f}\nD={slope/6:.2e} Å²/fs",
             )
             ax.legend(fontsize=7)
-        ax.set_title(label, fontsize=9)
+        ax.set_title(f"{label} (COM)", fontsize=9)
         ax.set_xlabel("time (fs)")
         if col == 0:
             ax.set_ylabel("MSD (Å²)")
-    fig.suptitle(f"MSD check — {run_dir.name}", fontsize=11)
+    fig.suptitle(f"Molecular COM MSD — {run_dir.name}", fontsize=11)
     fig.tight_layout()
     out = run_dir / "msd_check.png"
     fig.savefig(out, dpi=140)
@@ -431,36 +386,35 @@ def save_state_msd_plot(run_dir: Path):
     return out
 
 
-def save_state_rdf_plot(run_dir: Path, box_length: float):
+def save_state_rdf_plot(run_dir: Path, box_length: float, rdf_tables=None):
     """
-    Write run_dir/rdf_check.png for this one state point.
-
-    Marks L/2 so you can see where periodic boundaries make g(r) unreliable.
+    Write run_dir/rdf_check.png from molecular COM–COM partial RDFs.
     """
-    rdf_path = run_dir / "rdf.out"
     fig, axes = plt.subplots(2, 3, figsize=(11, 6.0), sharex=True)
     axes = axes.ravel()
     half = 0.5 * box_length
-    for col, (label, pair_index, _xi, _xj, _like) in enumerate(RDF_PARTIALS):
+    for col, (label, _sp_i, _sp_j, _like) in enumerate(mcom.COM_RDF_PAIRS):
         ax = axes[col]
-        if not rdf_path.exists():
-            ax.set_title(f"{label}: missing rdf.out")
-            continue
-        r, g = parse_rdf(rdf_path, pair_index=pair_index)
+        if rdf_tables is not None and label in rdf_tables:
+            r, g = rdf_tables[label]
+        else:
+            path = run_dir / f"rdf_com_{label}.dat"
+            if not path.exists():
+                ax.set_title(f"{label}: missing")
+                continue
+            data = np.loadtxt(path, comments="#")
+            r, g = data[:, 0], data[:, 1]
         ax.plot(r, g, lw=1.0, color="0.25")
         ax.axhline(1.0, color="0.6", ls="--", lw=0.7)
         ax.axvline(half, color="#c44e52", ls=":", lw=1.2, label=f"L/2={half:.2f} Å")
-        if len(r):
-            ax.axvspan(half, float(r[-1]), color="#c44e52", alpha=0.08)
-        g_in = g[r < half] if len(r) else g
-        gmax = float(g_in.max()) if len(g_in) else float("nan")
-        ax.set_title(f"rdf_{label}\nmax(<L/2)={gmax:.2f}", fontsize=8)
+        gmax = float(g.max()) if len(g) else float("nan")
+        ax.set_title(f"COM {label}\nmax={gmax:.2f}", fontsize=8)
         ax.set_xlabel("r (Å)")
         if col % 3 == 0:
             ax.set_ylabel("g(r)")
         ax.legend(fontsize=7, loc="upper right")
     fig.suptitle(
-        f"Partial RDFs — {run_dir.name} (shaded = beyond L/2, do not trust)",
+        f"Molecular COM–COM RDFs — {run_dir.name}",
         fontsize=11,
     )
     fig.tight_layout()
@@ -471,11 +425,7 @@ def save_state_rdf_plot(run_dir: Path, box_length: float):
 
 
 def save_msd_diagnostic(path_run: Path, sample_dirs):
-    """
-    Overview MSD figure for a few state points (also written under path_run/).
-
-    WHY: a Rosenfeld fit is meaningless if D itself comes from a noisy non-linear MSD.
-    """
+    """Overview MSD figure for a few state points (molecular COM)."""
     n = len(sample_dirs)
     if n == 0:
         return
@@ -498,12 +448,12 @@ def save_msd_diagnostic(path_run: Path, sample_dirs):
                 ax.plot(t_fit, slope * t_fit + intercept, color="#FF9999", lw=1.5,
                         label=f"late fit R²={r**2:.3f}")
                 ax.legend(fontsize=7)
-            ax.set_title(f"{run_dir.name}\n{label}", fontsize=8)
+            ax.set_title(f"{run_dir.name}\n{label} (COM)", fontsize=8)
             if row == n - 1:
                 ax.set_xlabel("time (fs)")
             if col == 0:
                 ax.set_ylabel("MSD (Å²)")
-    fig.suptitle("MSD linearity check (late-time Einstein window)", fontsize=11)
+    fig.suptitle("Molecular COM MSD linearity check", fontsize=11)
     fig.tight_layout()
     out = path_run / "msd_check.png"
     fig.savefig(out, dpi=140)
@@ -512,42 +462,36 @@ def save_msd_diagnostic(path_run: Path, sample_dirs):
 
 
 def save_rdf_diagnostic(path_run: Path, sample_dirs, box_lengths=None):
-    """Overview partial g(r) figure for a few state points under path_run/."""
+    """Overview molecular COM–COM g(r) for a few state points."""
     n = len(sample_dirs)
     if n == 0:
         return
-    fig, axes = plt.subplots(n, len(RDF_PARTIALS), figsize=(14, 2.4 * n), sharex=True)
+    pairs = mcom.COM_RDF_PAIRS
+    fig, axes = plt.subplots(n, len(pairs), figsize=(14, 2.4 * n), sharex=True)
     if n == 1:
         axes = np.array([axes])
     for row, run_dir in enumerate(sample_dirs):
         half = None
         if box_lengths is not None and row < len(box_lengths):
             half = 0.5 * box_lengths[row]
-        rdf_path = run_dir / "rdf.out"
-        for col, (label, pair_index, _xi, _xj, _like) in enumerate(RDF_PARTIALS):
+        for col, (label, _a, _b, _like) in enumerate(pairs):
             ax = axes[row, col]
-            if not rdf_path.exists():
+            path = run_dir / f"rdf_com_{label}.dat"
+            if not path.exists():
                 continue
-            r, g = parse_rdf(rdf_path, pair_index=pair_index)
+            data = np.loadtxt(path, comments="#")
+            r, g = data[:, 0], data[:, 1]
             ax.plot(r, g, lw=1.0)
             ax.axhline(1.0, color="0.6", ls="--", lw=0.7)
             if half is not None:
                 ax.axvline(half, color="#c44e52", ls=":", lw=1.0)
-                if len(r):
-                    ax.axvspan(half, float(r[-1]), color="#c44e52", alpha=0.08)
-                g_in = g[r < half]
-                gmax = float(g_in.max()) if len(g_in) else float("nan")
-            else:
-                gmax = float(g.max()) if len(g) else float("nan")
-            ax.set_title(f"{run_dir.name}\nrdf_{label}\nmax={gmax:.2f}", fontsize=7)
+            gmax = float(g.max()) if len(g) else float("nan")
+            ax.set_title(f"{run_dir.name}\nCOM {label}\nmax={gmax:.2f}", fontsize=7)
             if row == n - 1:
                 ax.set_xlabel("r (Å)")
             if col == 0:
                 ax.set_ylabel("g(r)")
-    fig.suptitle(
-        "Partial site-site RDFs (liquid-like peaks >> 1; red = beyond L/2)",
-        fontsize=11,
-    )
+    fig.suptitle("Molecular COM–COM RDFs (peaks >> 1 expected for a liquid)", fontsize=11)
     fig.tight_layout()
     out = path_run / "rdf_check.png"
     fig.savefig(out, dpi=140)
@@ -589,7 +533,9 @@ def main():
             ana = analyze_state_point(run_dir, T, rho)
             # Per-state diagnostic PNGs inside T*_rho*/ (in addition to run-level overview)
             msd_png = save_state_msd_plot(run_dir)
-            rdf_png = save_state_rdf_plot(run_dir, ana["box_length"])
+            rdf_png = save_state_rdf_plot(
+                run_dir, ana["box_length"], rdf_tables=ana.get("rdf_tables")
+            )
             print(f"  wrote {msd_png.name}, {rdf_png.name}")
 
             results_T.append(T)
@@ -774,8 +720,8 @@ def plot_rosenfeld(path_run: Path, s2s, Dstars, Ts, rhos):
 
     legend_loc = _legend_loc_least_overlap(ax, s2_plot, D_plot)
     ax.legend(loc=legend_loc, fontsize=8, framealpha=0.9)
-    ax.set_xlabel(r"$s_2/k_B$ (molecular-site mixture)")
-    ax.set_ylabel(r"$D^*$ (avg molecular-site)")
+    ax.set_xlabel(r"$s_2/k_B$ (molecular COM mixture)")
+    ax.set_ylabel(r"$D^*$ (avg molecular COM)")
     ax.set_title("Reduced Diffusion vs. Pairwise Excess Entropy")
     fig.tight_layout()
     out = path_run / "plot.png"
