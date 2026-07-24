@@ -41,13 +41,15 @@ neigh_modify    delay 0 every 1 check yes
 
 # Thermo output during minimize / runs
 thermo_style    custom step temp pe ke etotal press vol
-thermo          100
+thermo          1000
 
 # --- Energy minimization (relax overlaps from Packmol) ---
 minimize        1.0e-4 1.0e-6 1000 10000
 reset_timestep  0
 
-# Timestep in femtoseconds (units real)
+# Timestep in femtoseconds (units real).
+# Keep 1.0 fs for all-atom Reline (H vibrations). Longer *physical* time comes
+# from more steps in pipeline.py, not a larger dt (unless SHAKE is added later).
 timestep        1.0
 
 # TEMP_PLACEHOLDER = temperature in Kelvin (filled by pipeline.py)
@@ -63,15 +65,19 @@ reset_timestep  0
 
 fix             2 all nvt temp TEMP_PLACEHOLDER TEMP_PLACEHOLDER 100.0
 
-# Radial distribution function (RDF)
-compute         rdf all rdf 100
-fix             rdf_avg all ave/time 10 100 1000 c_rdf[*] file rdf.out mode vector
-
-# Mean squared displacement (MSD)
-compute         msd all msd com yes
-variable        msd_val equal c_msd[4]
-variable        time_fs equal step*dt
-fix             msd_out all print 100 "${time_fs} ${msd_val}" file msd.dat screen no title "# time_fs msd"
+# ---------------------------------------------------------------------------
+# Dump unwrapped atom coordinates for molecular center-of-mass (COM) analysis
+#
+# WHY: MSD and RDF are computed in pipeline.py from true molecular COMs:
+#   R_com = sum(m_i * r_i) / sum(m_i)
+# using molecule IDs from data.reline (1-10 choline, 11-20 Cl, 21-40 urea).
+# Unwrapped xu,yu,zu keep molecules intact across periodic boundaries.
+#
+# DUMP_EVERY_PLACEHOLDER is filled by pipeline.py (~200 frames over production).
+# ---------------------------------------------------------------------------
+dump            comtraj all custom DUMP_EVERY_PLACEHOLDER dump.com.lammpstrj id mol type mass xu yu zu
+dump_modify     comtraj sort id
 
 run             PROD_STEPS_PLACEHOLDER
 unfix           2
+undump          comtraj
